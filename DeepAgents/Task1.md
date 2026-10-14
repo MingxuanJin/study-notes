@@ -4,7 +4,7 @@
 
 ## Task1完成的内容：
 
-用agentseek的defaul模版做了第一章和第二章的两个实验，学习了DeepAgents的基础知识
+用agentseek的default模版做了第一章和第二章的两个实验，学习了DeepAgents的基础知识
 
 offline验证通过
 
