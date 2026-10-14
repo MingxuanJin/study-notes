@@ -8,7 +8,7 @@
 
 offline验证通过
 
-![image-20261014172501928](/Users/mingxuan_jin/Desktop/study-notes/Pics/image-20261014172501928.png)
+![image-20261014172501928](images/image-20261014172501928.png)
 
 Live验证：使用模型deepseek-flash
 
@@ -20,11 +20,11 @@ Live验证：使用模型deepseek-flash
 
 Live验证返回的结果：
 
-![image-20261014174746112](/Users/mingxuan_jin/Desktop/study-notes/Pics/image-20261014174746112.png)
+![image-20261014174746112](images/image-20261014174746112.png)
 
 LangSmith Trace：
 
-![image-20261014165235517](/Users/mingxuan_jin/Desktop/study-notes/Pics/image-20261014165235517.png)
+![image-20261014165235517](images/image-20261014165235517.png)
 
 # 笔记
 
