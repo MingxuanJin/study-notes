@@ -1,8 +1,324 @@
 # Task2 打卡
 
+## 1.梳理&理清思路
+
+Content-builder模版的后端用的是FileSystemBackend
+
+```python
+backend = FilesystemBackend(root_dir=EXAMPLE_DIR, virtual_mode=True)
+    memory_sources = ["/AGENTS.md", "/memory/preferences.md"]
+```
+
+而主模版research-deepagent用的是`StateBackend`（文件存在图的 `files` 通道里，不落盘）
+
+| 层         | 存什么                                                       | 落在哪                                                       | 谁看不见           |
+| :--------- | :----------------------------------------------------------- | :----------------------------------------------------------- | :----------------- |
+| 磁盘工作区 | `write_file`/`edit_file`/`save_report` 写的文件、`memory/preferences.md` | `content_builder_deepagent/` 下真实文件                      | 换机器就没了       |
+| 图状态     | `messages`、`todos`；若用 `StateBackend` 才算文件的 `files`  | checkpoint（SeekDB，`~/.agentseek/content_builder_deepagent/seekdb`） | 换 thread 就看不到 |
+| 自动外溢   | 超过 20k token 的工具结果                                    | `/large_tool_results/<tool_call_id>`                         | 模型只看到截断预览 |
+
+## 2.确认了路径映射
+
+运行以下脚本：
+
+```python
+# 在 content_builder_deepagent/ 下：uv run python
+from deepagents.backends import FilesystemBackend
+fs = FilesystemBackend(root_dir=".", virtual_mode=True)
+
+print(fs.write("/notes/lab.md", "v1\n第一行\n"))   # 虚拟路径
+print(fs.read("/notes/lab.md"))                   # 返回带行号的文本
+print(fs.ls("/notes"))
+print(fs.edit("/notes/lab.md", "v1", "v2"))
+print(fs.read("/notes/../notes/lab.md"))          # 应被拒：virtual_mode 阻止 ..
+```
+
+终端输出：
+
+```bash
+WriteResult(error=None, path='/notes/lab.md') # 写入成功
+ReadResult(error=None, file_data={'content': 'v1\n第一行\n', 'encoding': 'utf-8'}, total_lines=2, start_line=1, end_line=2, next_offset=None, no_lines_requested=False) # 读取成功
+LsResult(error=None, entries=[{'path': '/notes/lab.md', 'is_dir': False, 'size': 13, 'modified_at': '2026-10-17T15:08:28.211959'}]) # ls成功
+EditResult(error=None, path='/notes/lab.md', occurrences=1) # 替换成功，把v1改成了v2
+Traceback (most recent call last):
+  File "../research_deepagent/content_builder_deepagent/src/content_builder_deepagent/test.py", line 9, in <module>
+    print(fs.read("/notes/../notes/lab.md"))          # 应被拒：virtual_mode 阻止 ..
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/research_deepagent/.venv/lib/python3.12/site-packages/deepagents/backends/filesystem.py", line 460, in read
+    resolved_path = self._resolve_path(file_path)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/research_deepagent/.venv/lib/python3.12/site-packages/deepagents/backends/filesystem.py", line 207, in _resolve_path
+    raise ValueError(msg)
+ValueError: Path traversal not allowed # 因为开启了virtual_mode = True, 路径穿越拦截成功
+```
+
+## 3.观察写 -> 读回 -> 修改的完整闭环
+
+### offline验证
+
+测试用代码：
+
+```python
+"""练习1：写 → 读回 → 补丁改 → 失败不改 → 整篇覆盖（无 API 调用）"""
+import hashlib
+import os
+from pathlib import Path
+
+# 环境变量伪装，防止测试时触发真实的网络请求或外部依赖报错
+os.environ.setdefault("AGENTSEEK_MODEL_PROVIDER", "openai")
+os.environ.setdefault("AGENTSEEK_MODEL", "course-scripted")
+os.environ.setdefault("OPENAI_API_KEY", "unused-scripted-key")
+os.environ.setdefault("CONTENT_MODE", "text")
+os.environ.setdefault("LANGSMITH_TRACING", "false")
+
+from langchain_core.messages import AIMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from scripted_model import ScriptedModel, call
+
+from content_builder_deepagent import agent
+
+root = Path(agent.EXAMPLE_DIR)
+outline = root / "notes" / "outline.md"
+report = root / "blogs" / "fslab" / "post.md"
+# 准备写入的初稿模板字符串
+REPORT_V1 = "# FS lab\n\n## Context\n初稿 v1\n\n## Sources\n- sources/files.md\n"
+
+# 通过 ScriptedModel 模拟了一个 Agent 依次执行 5 种典型文件系统场景
+model = ScriptedModel(replies=[
+    call("write_file", {"file_path": "/notes/outline.md",
+                        "content": "一、背景\n二、发现\n三、步骤\n"}, "w1"),
+    call("read_file", {"file_path": "/notes/outline.md"}, "r1"),
+    # 补丁修改
+    call("edit_file", {"file_path": "/notes/outline.md",
+                       "old_string": "二、发现", "new_string": "二、发现（已核对）"}, "e1"),
+    call("read_file", {"file_path": "/notes/outline.md"}, "r2"),
+    # 异常修改
+    call("edit_file", {"file_path": "/notes/outline.md",
+                       "old_string": "这行不存在", "new_string": "x"}, "e2"),
+    call("read_file", {"file_path": "/notes/outline.md"}, "r3"),
+    # 写入初稿v1
+    call("save_report", {"slug": "fslab", "content": REPORT_V1}, "s1"),
+    call("read_report", {"slug": "fslab"}, "r4"),
+    # 覆盖保存，将正文内的 v1 换成 v2 后整篇覆盖保存
+    call("save_report", {"slug": "fslab", "content": REPORT_V1.replace("v1", "v2")}, "s2"),
+    call("read_report", {"slug": "fslab"}, "r5"),
+    AIMessage(content="done"),
+])
+
+# 哈希指纹函数
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:12] if path.exists() else "-"
+
+# 执行 LangGraph 状态图与状态监听
+graph = agent.build_graph(model, checkpointer=InMemorySaver())
+seen, last = {}, ("-", "-")
+# 启动agent循环
+for chunk in graph.stream(
+    {"messages": [{"role": "user", "content": "练习1"}]},
+    {"configurable": {"thread_id": "fslab-1"}},
+    stream_mode="updates",
+):
+    for update in chunk.values():
+        if not isinstance(update, dict):
+            continue
+        for m in update.get("messages") or []:
+            if getattr(m, "type", None) == "tool":
+                seen[m.tool_call_id] = str(m.content)
+                print(f"\n[{m.name}] {str(m.content).splitlines()[0]}")
+    # 磁盘哈希变动监听
+    now = (digest(outline), digest(report))
+    if now != last:
+        print(f"  disk  outline={now[0]}  report={now[1]}")
+        last = now
+
+checks = {
+    "大纲最终内容正确": outline.read_text() == "一、背景\n二、发现（已核对）\n三、步骤\n",
+    "报告被整篇覆盖为 v2": "v2" in report.read_text(),
+    "首次读回没有修改后的字样": "已核对" not in seen["r1"],
+    "失败编辑后读回与成功编辑后一致": seen["r2"] == seen["r3"],
+    "失败编辑返回 Error": seen["e2"].startswith("Error"),
+}
+print()
+for name, ok in checks.items():
+    print("PASS" if ok else "FAIL", name)
+```
+
+
+
+输出结果
+
+```bash
+[write_file] Updated file /notes/outline.md
+  disk  outline=0d8bf301aa0a  report=- # 成功写入，报告尚未创建
+
+[read_file] 1  一、背景 # read_file返回的是带行号的视图
+
+[edit_file] Successfully replaced 1 instance(s) of the string in '/notes/outline.md'
+  disk  outline=6d06803856d5  report=- # 成功edit
+
+[read_file] 1  一、背景
+
+[edit_file] Error: String not found in file: '这行不存在' # 修改不存在的内容
+
+[read_file] 1  一、背景
+
+[save_report] Saved blogs/fslab/post.md; use read_report to verify it.
+  disk  outline=6d06803856d5  report=52528be28a28 # 初稿写入，第一次在disk上生成报告
+
+[read_report] # FS lab
+
+[save_report] Saved blogs/fslab/post.md; use read_report to verify it.
+  disk  outline=6d06803856d5  report=13829e537f1d # 覆盖写入report
+
+[read_report] # FS lab
+
+PASS 大纲最终内容正确
+PASS 报告被整篇覆盖为 v2
+PASS 首次读回没有修改后的字样
+PASS 失败编辑后读回与成功编辑后一致
+PASS 失败编辑返回 Error # 验收检查成功
+```
+
+
+
+#### 结论
+
+1. `write_file` 成功返回的那一刻，文件已经在磁盘上（不是图结束时才写）
+
+2. `read_file` 返回的是**带行号的视图**（`1 一、背景`），不是原始字节
+
+3. `edit_file` 是补丁：找不到 `old_string` 就报错，**文件一个字节都不变**
+
+4. `save_report` 是整篇覆盖：同一 slug 再存一次，旧内容整体被替换
+
+   
+
+### live验证
+
+使用模型：deepseek-flash
+
+使用prompt： 
+
+只做文件练习，按顺序一次一个工具，等上一个结果返回再继续，不要合并调用： 1) 用 write_file 把三行大纲写到 /notes/outline.md：一、背景 / 二、发现 / 三、步骤 2) 用 read_file 读回 /notes/outline.md，原样复述 3) 用 edit_file 把「二、发现」改成「二、发现（已核对）」，只改这一处 4) 用 edit_file 把「这行不存在」替换成「x」；如果失败，原样报告错误文本 5) 用 read_file 再读一次，并说明第 3 步和第 4 步之后内容有什么差别 6) 用 save_report(slug="fslab") 保存含标题和 Sources 的短报告，再 read_report 读回 7) 用同一 slug 再 save_report 一次，把正文 v1 改成 v2，再 read_report 读回 不要用 read_source，不要联网，不要生成图片。
+
+终端output：
+
+```bash
+stat -f "%Sm %N" notes/outline.md
+Oct 17 16:35:27 2026 notes/outline.md
+ls -l blogs/fslab/
+-rw-r--r--@ 1 mingxuan_jin  staff  1387 Oct 17 16:35 post.md
+```
+
+证明这两个文件确实是由你刚才这轮包含 7 个步骤的 Prompt **端到端一次性驱动生成并更新的**
+
+```bash
+shasum notes/outline.md
+86a46a2e67e60b66627f3377561cd6771e886565  notes/outline.md
+```
+
+系统计算出了明确的 SHA-1 指纹（`86a46a...`），说明文件存在且内容确定
+
+```bash
+ls -l blogs/fslab/
+-rw-r--r--@ 1 mingxuan_jin  staff  1387 Oct 17 16:35 post.md
+```
+
+文件大小为 `1387` 字节。
+
+证明第 6 步和第 7 步中，`save_report(slug="fslab")` 成功在磁盘上递归建立了 `blogs/fslab/` 目录并生成了 `post.md`
+
+#### 结论
+
+**Agent 的工具链调度逻辑完全合格**：
+
+- 真实模型在未开启联网、未生成图片的前提下，能够严格遵循复杂的多步时序约束（写 → 读 → 补丁改 → 异常处理 → 再次读 → 生成报告 → 覆盖报告）。
+
+**虚拟文件系统成功实现了物理落盘**：
+
+- `FilesystemBackend` 在 Live 真实模型环境下，并非仅仅停留在内存模拟，而是如实映射到了操作系统的物理磁盘（`notes/outline.md` 和 `blogs/fslab/post.md` 双双落地）。
+
+**闭环验证成立**：
+
+- 配合之前在 `ScriptedModel` 离线验证中跑通的 `PASS` 逻辑，这次 Live 验证证明了：**当脱离 Mock 环境、接入真实 LLM 后，这套基于文件系统的 Agent 架构具备真正的生产可用性与状态一致性**
+
+
+
+## 4.增加修改资料与报告tools
+
+在lesson_tools中加入了两个tools，分别是save_material和read_material
+
+### Offline验证
+
+测试结果
+
+| 步骤                 | 工具返回                                                    | 磁盘 / 读回                      |
+| :------------------- | :---------------------------------------------------------- | :------------------------------- |
+| `save_material`      | `Saved materials/brief.md; use read_material to verify it.` | `materials/brief.md` 首次出现    |
+| `read_material`      | **原文**，没有行号                                          | 和磁盘字节一致                   |
+| `edit_file`          | `Successfully replaced 1 instance(s) ...`                   | sha 变化，只有 `status` 那一处变 |
+| 失败 `edit_file`     | `Error: String not found in file: 'no-such-line'`           | sha 不变，读回和上一步完全相同   |
+| 同名 `save_material` | 同上                                                        | **整篇替换**，不是追加/合并      |
+| `save_report`        | `Saved blogs/matlab/post.md; ...`                           | 报告里出现 `materials/brief.md`  |
+
+### Live验证
+
+使用模型：deepseek-flash
+
+#### Prompt
+
+只做资料与报告练习，按顺序一次一个工具，等结果返回再做下一步：
+1) 用 save_material 把一份 3 行资料写到 brief.md，字段为 title、status、note
+2) 用 read_material 读回并原样复述
+3) 用 edit_file 只把 status 改成 final
+4) 用 read_material 再读回，说明改了什么、没改什么
+5) 用 save_material 整篇重写一次，往 note 里加一句
+6) 用 save_report(slug="matlab") 写一份短报告，Sources 里只写 materials/brief.md
+7) 用 read_report 读回报告，确认引用路径正确
+  不要动 sources/，不要联网，不要生成图片。
+
+#### Agent输出
+
+七个步骤全部完成，结果如下。
+
+**1) 初次保存** materials/brief.md，3 行，字段 title / status / note（`status: draft`）。
+
+**2) 读回原文（逐字）**
+
+```
+title: 资料与报告流程演练
+status: draft
+note: 这是一份三行资料，用于验证保存、读取、编辑、重写的完整流程。
+```
+
+**3) 局部编辑** `edit_file` 只替换了 `status: draft` → `status: final`，报告「替换 1 处」。
+
+**4) 再次读回：改了什么 / 没改什么**
+
+- 改了：第 2 行 `status` 从 `draft` 变成 `final`，仅此一处。
+- 没改：`title` 仍是「资料与报告流程演练」；`note` 文字、标点逐字相同；仍是 3 行，字段顺序不变。
+
+**5) 整篇重写** 用 `save_material` 覆盖写入，只在 `note` 末尾追加了一句，其余字段保持原值。重写后读回确认：
+
+```
+title: 资料与报告流程演练
+status: final
+note: 这是一份三行资料，用于验证保存、读取、编辑、重写的完整流程。重写时在 note 末尾追加了一句，其余字段保持不变。
+```
+
+**6) 报告** 已保存到 blogs/matlab/post.md（短报告：资料文件保存与编辑流程验证），Sources 一节只有一条：`materials/brief.md`。
+
+**7) 读回报告核对引用路径** 读回内容与写入一致，Sources 中唯一路径为 `materials/brief.md`，与实际保存的资料文件（materials/brief.md）完全对应，大小写、目录层级均无误，无多余或多级路径引用。
+
+全程未读取或修改 `sources/`，未联网，未生成图片。方法上的要点：局部改动用 `edit_file`，整篇替换用 `save_material`，两者不要混用。
+
 
 
 # 笔记
+
+声明：本笔记内容来源于对datawhialechina deep-agents-in-action项目第一章以及第二章内容的学习，相关著作权归作者本人
+
+教程链接：https://datawhalechina.github.io/deepagents-in-action/chapters/ch01-agent-harness/；
 
 ## Chap.3 虚拟文件系统
 
