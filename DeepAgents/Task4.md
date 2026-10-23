@@ -81,6 +81,12 @@ todos 随 checkpoint 持久化；todo 标 completed 不代表报告已写入。[
 
 # 笔记
 
+声明：本笔记内容来源于对datawhialechina deep-agents-in-action项目第一章以及第二章内容的学习，相关著作权归作者本人
+
+教程链接：https://datawhalechina.github.io/deepagents-in-action/
+
+Chap.5
+
 ## 为什么需要子 Agent？
 
 ### 上下文膨胀问题
