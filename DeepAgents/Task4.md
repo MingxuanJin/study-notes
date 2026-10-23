@@ -1,0 +1,436 @@
+Task4
+
+# 打卡
+
+## 本次打卡做的：
+
+针对**工具映射**这一个变量：把子代理的 `tavily_search` 摘掉，看它还能不能靠继承的 `read_file` 完成「核对固定资料」
+
+## 验证
+
+1. 子代理的工具表由 `research_sub_agent["tools"]` 决定，而不是由 `system_prompt` 决定；
+2. 移除 `tavily_search` 后，子代理仍保留继承的文件工具，能干完「读固定资料 → 写审计文件」这一件事
+
+修改之前：
+
+```python
+research_sub_agent = {
+    "name": "research-agent",
+    "description": (
+        "Delegate research to the sub-agent researcher. "
+        "Only give this researcher one topic at a time."
+    ),
+    "system_prompt": RESEARCHER_INSTRUCTIONS.format(date=current_date),
+    "tools": [tavily_search, think_tool],
+}
+```
+
+结合模版代码和本次课程所学内容，可以得出：
+
+子代理实际工具 = **继承的文件工具 + spec 里的 tools**，所以现在是 `read_file / write_file / ls / glob / grep / edit_file / delete + tavily_search + think_tool`，没有 `task`、没有 `write_todos`。
+
+## 修改内容
+
+"tools": [tavily_search, think_tool]中去掉了tavily_search，其他的显式声明均没有修改
+
+## 输出
+
+```bash
+== bind_tools calls ==
+call0: n=11 tavily=True think=True task=True write_todos=True
+call1: n=11 tavily=True think=True task=True write_todos=True
+call2: n=8 tavily=False think=True task=False write_todos=False
+call3: n=8 tavily=False think=True task=False write_todos=False
+call4: n=8 tavily=False think=True task=False write_todos=False
+call5: n=11 tavily=True think=True task=True write_todos=True
+subagent tools: ['delete', 'edit_file', 'glob', 'grep', 'ls', 'read_file', 'think_tool', 'write_file']
+== state ==
+files: ['/materials/brief.md', '/subagent_audit.md']
+task_args: [{'description': 'Read /materials/brief.md with read_file, then write the audit to /subagent_audit.md', 'subagent_type': 'research-agent'}]
+tool_messages: [('write_file', 'Updated file /materials/brief.md'), ('task', 'AUDIT_V1 written by research-agent')]
+== exported ==
+artifacts/subagent_audit.md, artifacts/brief.md
+```
+
+- 主代理发出了一次 `task`，参数为 `subagent_type="research-agent"`，`description` 里带 `/materials/brief.md` 路径（子代理拿不到用户原文，资料位置必须在 description 里给全）；
+- 子代理返回 `AUDIT_V1 written by research-agent`；
+- 子代理写入的 `/subagent_audit.md` 出现在**父线程** `state.files` 中，说明子代理的文件写入通过 `Command` 合并回主图；
+- 父 state 只保留主代理的 `write_file` 与 `task` 两条 ToolMessage；子代理内部的 `read_file` 不回传父 state
+
+导出了artifacts/subagent_audit.md，内容为：
+
+```bash
+AUDIT_V1
+## M1
+deepagents 0.7 必须显式传 TodoListMiddleware，write_todos 才会出现在工具列表。[1]
+## M2
+一个模型响应最多一次 write_todos，并行多次会被 middleware 拒绝。[2]
+## M3
+todos 随 checkpoint 持久化；todo 标 completed 不代表报告已写入。[3]
+### Sources
+[1] Synthetic note M1
+[2] Synthetic note M2
+[3] Synthetic note M3
+```
+
+输出证明了：
+
+- 工具表按 spec 生效；
+- 委派链路真的走到了 `research-agent`；
+- 子代理能用继承的 `write_file` 把文件写回父线程。
+
+# 笔记
+
+## 为什么需要子 Agent？
+
+### 上下文膨胀问题
+
+假设主 Agent 要完成一个研究报告，其中一个子任务是”搜索 LangGraph 的技术文档”。这个子任务可能涉及：
+
+- 5 次网络搜索调用
+- 每次返回 3000+ tokens 的搜索结果
+- 多次 `write_file` 保存中间结果
+- 多次 `read_file` 回顾和整理
+
+这些中间过程产生了<span style="color: #b8860b">大量的工具调用记录，全部堆在主 Agent 的上下文里</span>。
+
+虽然第 3 章的自动卸载机制能缓解一部分，但主 Agent 其实**根本不需要知道这些细节**——它只需要最终的研究摘要。
+
+### Context Quarantine
+
+子 Agent 的核心设计
+
+1. 主 Agent 通过 `task` 工具**创建**一个子 Agent
+2. 子 Agent 在**独立的上下文**中执行任务（中间调用记录不进入主 Agent 对话；共用 Backend 时，文件仍可共享）
+3. 子 Agent 完成后，只把**最终结果**返回给主 Agent
+4. 主 Agent 的上下文保持干净
+
+主 Agent 是项目经理，子 Agent 是专项负责人。项目经理不需要参加每一个技术讨论会——他只需要看到每个负责人提交的总结报告
+
+### 什么时候用子 Agent
+
+| 场景                                     | 是否用子 Agent | 理由                                    |
+| ---------------------------------------- | -------------- | --------------------------------------- |
+| 需要**多次搜索和整理**的研究任务         | ✅              | 大量中间结果会膨胀主 Agent 上下文       |
+| 需要特殊工具或指令的专业任务             | ✅              | 子 Agent 可以有自己的工具集和系统提示词 |
+| 需要不同模型能力的任务                   | ✅              | 子 Agent 可以用不同的模型               |
+| 需要高层协调的复杂任务                   | ✅              | 主 Agent 专注协调，子 Agent 专注执行    |
+| 单步简单查询                             | ❌              | 委派开销大于收益                        |
+| 需要主 Agent 看到子 Agent 的完整调用过程 | ❌              | 主 Agent 只收到最终结果                 |
+
+总之就是复杂的需要子agent，但是如果需要主agent看到完整过程，就不能用子agent
+
+
+
+## 定义子 Agent：字典方式
+
+最常用的方式是用**字典**定义子 Agent
+
+```python
+from deepagents import create_deep_agent
+
+# 定义一个研究型子 Agent
+research_subagent = {
+    "name": "researcher",                # 必填：唯一标识符
+    "description": "深入研究特定主题，搜索多个信息源并整理成摘要",  # 必填：主 Agent 靠它决定何时委派
+    "system_prompt": """你是一位专业的研究员。你的任务是：
+1. 把研究问题拆解为多个搜索查询
+2. 用 internet_search 搜索相关信息
+3. 整理发现，写成简洁摘要
+4. 列出关键发现和信息来源
+
+注意：返回结果控制在 500 字以内，只返回核心发现。""",  # 必填：子 Agent 自己的指令
+    "tools": [internet_search],          # 可选，默认继承；显式指定后完全替换（不合并）
+    "skills": ["/skills/research/"],     # 可选，不继承主 Agent；指定后独立运行 SkillsMiddleware
+}
+
+agent = create_deep_agent(
+    model="google_genai:gemini-3.1-pro-preview",
+    skills=["/skills/main/"],            # 主 Agent 和 general-purpose 子 Agent 继承此处
+    subagents=[research_subagent],       # researcher 只获得 /skills/research/，不获得 /skills/main/
+)
+```
+
+### 字段说明
+
+| 字段              | 必填 | 继承主 Agent？             | 说明                                                         |
+| ----------------- | ---- | -------------------------- | ------------------------------------------------------------ |
+| `name`            | ✅    | —                          | 唯一标识符，主 Agent 通过它指定委派给谁；同时作为流式输出和追踪中的 `lc_agent_name` 元数据 |
+| `description`     | ✅    | —                          | 描述子 Agent 的能力，主 Agent 靠它决策路由                   |
+| `system_prompt`   | ✅    | ❌ 不继承                   | 子 Agent 自己的指令，需要独立定义                            |
+| `tools`           | 可选 | ✅ 默认继承，指定后完全替换 | 子 Agent 工具集；不指定则继承主 Agent 的所有工具，指定后完全替换（不合并） |
+| `model`           | 可选 | ✅ 默认继承                 | 可指定不同模型，支持 LangChain 对象或 `"provider:model"` 字符串（如 `"openai:gpt-5.4"`） |
+| `middleware`      | 可选 | ❌ 不继承                   | 子 Agent 自己的中间件                                        |
+| `interrupt_on`    | 可选 | ✅ 默认继承                 | 子 Agent 的人工审批配置，可覆盖主 Agent                      |
+| `skills`          | 可选 | ❌ 不继承                   | 子 Agent 自己的 Skills 路径；指定后子 Agent 运行独立的 SkillsMiddleware，技能状态与主 Agent 完全隔离 |
+| `response_format` | 可选 | ❌ 不继承                   | 结构化输出 schema（需 `deepagents>=0.5.3`）；设置后主 Agent 收到 JSON 而非自由文本 |
+| `permissions`     | 可选 | ✅ 默认继承，指定后完全替换 | 文件系统权限规则；指定后完全替换主 Agent 的权限配置          |
+
+关键点：**子 Agent 的 `system_prompt` 不继承主 Agent**——每个子 Agent 应有自己专属的指令。`tools` 默认继承主 Agent 的工具集，但一旦显式指定就会完全替换（不是合并）。**`skills` 也不继承**——主 Agent 的 `skills` 只会传给 general-purpose 子 Agent，其他子 Agent 需要显式配置自己的 `skills` 路径。
+
+> [!NOTE]
+>
+> 总之就是只有tools会继承，指定的话就会替换
+
+`permissions` 同样需要特别小心：省略时继承父规则，显式提供后则整体替换而非叠加。如何为只读审计子 Agent 写出闭合的权限集，见[第 11 章：文件系统权限](https://datawhalechina.github.io/deepagents-in-action/chapters/ch11-filesystem-permissions/)
+
+## General-purpose 子 Agent：默认的”万能助手”
+
+即使你不定义任何子 Agent，Deep Agents 也自带一个 **general-purpose 子 Agent**。它**继承主 Agent 显式传入的 `tools`、`model` 和 `skills`**。
+
+
+
+它使用自己的<span style="color: #b8860b">默认系统提示词</span>（`DEFAULT_SUBAGENT_PROMPT`），并应用当前模型的 Harness Profile 提示词配置，**不会继承主 Agent 传入的 `system_prompt`**。需要自定义时，可在同名 spec 中设置 `system_prompt`，见下文[覆盖 general-purpose 子 Agent](https://datawhalechina.github.io/deepagents-in-action/chapters/ch05-subagents/#覆盖-general-purpose-子-agent)。提示词规则见[官方子 Agent 文档](https://docs.langchain.com/oss/python/deepagents/subagents#the-general-purpose-subagent)。
+
+中间件的继承范围更窄：它只继承主 Agent 对其默认中间件的**同名覆盖**，按 `.name` 匹配，不会带上仅为主 Agent 新增的中间件。默认栈中没有 `TodoListMiddleware`，因此主 Agent 的 Todo 配置不会传给它。
+
+```python
+# 不传 subagents 参数，也能用子 Agent
+agent = create_deep_agent(
+    model=model,
+    tools=[internet_search],
+    system_prompt="你是一位研究助手。",  # 只配置主 Agent，不会传给默认子 Agent
+)
+
+# 主 Agent 可以这样委派：
+# task(subagent_type="general-purpose", description="搜索量子计算的最新进展")
+```
+
+General-purpose 子 Agent 的作用是**上下文隔离**——它复用主 Agent 的模型和显式工具，使用自己的系统提示词，在独立的上下文中处理委派任务。主 Agent 不需要承受子任务中 10 次搜索带来的上下文膨胀，只需要收到一份精炼的摘要。
+
+### 禁用 general-purpose 子 Agent
+
+如果你不想让 Agent 拥有 `task` 工具，可以完全禁用子 Agent 机制
+
+```python
+from deepagents import create_deep_agent
+from deepagents.profiles import GeneralPurposeSubagentProfile, HarnessProfile, register_harness_profile
+
+# 两步缺一不可
+# 为指定模型注册 Harness Profile。
+register_harness_profile(
+    key="openai:zai-org/GLM-5.2",
+    profile=HarnessProfile(
+        general_purpose_subagent=GeneralPurposeSubagentProfile(
+            enabled=False
+        )
+    ),
+)
+
+agent = create_deep_agent(
+    model=model,
+    subagents=[],  # 不传任何同步子 Agent
+)
+```
+
+> [!NOTE]
+>
+> 需要两步
+>
+> 1. 为制定模型注册harness profile
+> 2. 不传任何同步子agent
+>
+> 不要用 `excluded_middleware` 来排除 `SubAgentMiddleware`——这会直接抛出 `ValueError`。正确做法是通过 `GeneralPurposeSubagentProfile(enabled=False)` 关闭。
+
+### 覆盖 general-purpose 子 Agent
+
+如果你想给默认子 Agent 配置不同的系统提示词、模型或工具，可以用 `name="general-purpose"` 来覆盖
+
+### 为 general-purpose 启用 Todo
+
+需要让默认子 Agent 也使用 `write_todos` 时，用同名 spec 显式配置它的中间件
+
+## CompiledSubAgent：集成 LangGraph 工作流
+
+对于更复杂的场景，可以用一个预构建的 LangGraph 图作为子 Agent
+
+<span style="color: #b8860b">适用于需要**多步骤、有分支逻辑**的工作流</span>
+
+```python
+from deepagents import create_deep_agent, CompiledSubAgent
+from langchain.agents import create_agent
+
+# 用 LangChain 创建一个自定义 Agent 图
+custom_graph = create_agent(
+    model=model,
+    tools=[statistical_analysis, generate_chart],
+    system_prompt="你是数据分析专家，擅长统计分析和可视化。",
+)
+
+# 包装为 CompiledSubAgent
+data_subagent = CompiledSubAgent(
+    name="data-analyzer",
+    description="执行复杂的数据分析任务，包括统计分析和图表生成",
+    runnable=custom_graph,  # 传入编译好的 LangGraph 图
+)
+
+agent = create_deep_agent(
+    model=model,
+    subagents=[data_subagent],
+)
+```
+
+`CompiledSubAgent` 的要求：传入的 LangGraph 图的 State 中必须包含 `"messages"` 键
+
+### 字典 vs CompiledSubAgent：怎么选？
+
+| 场景                               | 推荐方式         | 理由                                     |
+| ---------------------------------- | ---------------- | ---------------------------------------- |
+| 大多数情况                         | 字典方式         | 简单直观，配置灵活                       |
+| 子 Agent 需要复杂的多步骤工作流    | CompiledSubAgent | 可以用 LangGraph 的图 API 定义分支、循环 |
+| 子 Agent 已经有现成的 LangGraph 图 | CompiledSubAgent | 直接复用，无需重写                       |
+
+## 多子 Agent 协作模式
+
+实际项目中，最常见的模式是**多个专业子 Agent 协作**，由主 Agent 作为协调者
+
+![多子 Agent 协作模式：主 Agent 作为协调者，通过 task() 委派给 data-collector、data-analyzer、report-writer 三个专业子 Agent，每个子 Agent 在独立上下文中工作](https://datawhalechina.github.io/deepagents-in-action/imgs/14-framework-multi-subagent.png)
+
+执行流程：
+
+1. 主 Agent 使用显式启用的 `write_todos` 制定计划
+2. `task(subagent_type="data-collector", description="搜索 AI Agent 领域的最新趋势")` → 返回数据摘要
+3. `task(subagent_type="data-analyzer", description="分析以下数据...")` → 返回关键发现
+4. `task(subagent_type="report-writer", description="根据以下发现撰写报告...")` → 返回报告
+5. 主 Agent 整合输出
+
+每一步的子 Agent 都在独立上下文中工作，主 Agent 只看到精炼的返回结果。
+
+## 结构化输出：让子 Agent 返回 JSON
+
+默认情况下，主 Agent 收到的是子 Agent 最后一条消息的自由文本。通过 `response_format` 字段，可以让子 Agent 返回符合 Pydantic schema 的 JSON，方便主 Agent 程序化处理
+
+```python
+research_subagent = {
+    "name": "researcher",
+    "description": "研究特定主题并返回结构化发现",
+    "system_prompt": "深入研究给定主题，返回你的发现。",
+    "tools": [internet_search],
+    "response_format": ResearchFindings,  # 需要 deepagents>=0.5.3
+}
+
+```
+
+不设置 `response_format` 时主 Agent 收到自由文本；设置后主 Agent 始终收到符合 schema 的有效 JSON
+
+## 子 Agent 最佳实践
+
+### 1. 描述要具体
+
+主 Agent 靠 `description` 决定何时以及委派给谁。描述越具体，路由越准确：
+
+<span style="color: #b8860b">就像是任务分配要越明确越好，这样下属才知道要怎么分工</span>
+
+```
+# ✅ 好的描述
+"description": "执行深度网络研究，需要多次搜索、信息交叉验证和综合分析时使用"
+
+# ❌ 差的描述
+"description": "做研究"
+```
+
+### 2. System Prompt 要详细
+
+特别是要包含**输出格式要求**和**字数限制**——这直接影响返回给主 Agent 的内容质量
+
+<span style="color: #b8860b">就是规定了报告的具体要求，就可以提高报告的质量</span>
+
+```
+"system_prompt": """你是一位研究员。
+
+工具使用指导：
+- 用 internet_search 搜索信息，每次查询不同的关键词
+- 搜索 3-5 次以获取全面的信息
+
+输出格式：
+- 摘要（2-3 段）
+- 关键发现（要点列表）
+- 信息来源（附 URL）
+
+重要：返回结果控制在 500 字以内。"""
+```
+
+### 3. 工具集要精简
+
+最小权限原则——只给子 Agent 它需要的工具：
+
+分工越细越好，专人专办
+
+```
+# ✅ 精简：只给研究相关的工具
+research_agent = {"tools": [internet_search]}
+
+# ❌ 冗余：给了不需要的工具
+research_agent = {"tools": [internet_search, send_email, delete_file, execute_code]}
+```
+
+### 4. 不同子 Agent 用不同模型
+
+简单工作用小钱，复杂工作花大钱
+
+```python
+subagents = [
+    {
+        "name": "quick-lookup",
+        "description": "快速查询简单事实",
+        "tools": [internet_search],
+        "model": ChatOpenAI(  # 轻量快速模型
+            model="Qwen/Qwen2.5-7B-Instruct",
+            api_key=os.environ["SILICONFLOW_API_KEY"],
+            base_url="https://api.siliconflow.cn/v1",
+        ),
+        "system_prompt": "快速查找并返回简洁答案。",
+    },
+    {
+        "name": "deep-analyst",
+        "description": "执行需要深入推理的复杂分析任务",
+        "tools": [internet_search, statistical_analysis],
+        "model": ChatOpenAI(  # 强推理模型
+            model="zai-org/GLM-5.2",
+            api_key=os.environ["SILICONFLOW_API_KEY"],
+            base_url="https://api.siliconflow.cn/v1",
+        ),
+        "system_prompt": "深入分析并提供详细的推理过程。",
+    },
+]
+```
+
+### 5. 返回结果要精简
+
+<span style="color: #b8860b">在 system_prompt 中明确要求子 Agent 只返回核心内容：</span>
+
+```
+"system_prompt": """分析数据并返回：
+1. 关键洞察（3-5 条）
+2. 置信度评分
+3. 建议下一步行动
+
+不要包含：原始数据、中间计算过程、详细的工具输出。
+控制在 300 字以内。"""
+```
+
+如果子 Agent 把大量原始数据返回给主 Agent，就失去了上下文隔离的意义。
+
+## 常见问题排查
+
+
+
+| 现象 | 子 Agent 没被调用——主 Agent 自己做了所有工作                 | 上下文依然膨胀                                               | 调用了错误的子 Agent                                    |
+| ---- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------- |
+| 原因 | 主 Agent 无法从 description 判断何时应该委派                 | 子 Agent 返回了大量原始数据                                  | 多个子 Agent 的 description 过于相似，主 Agent 无法区分 |
+| 解法 | 让 description 更具体、更行为导向；在主 Agent 的 `system_prompt` 中明确指示委派 | 在子 Agent 的 `system_prompt` 中强制要求简洁返回；让子 Agent 把大量数据写入文件，只返回分析摘要 | 在 description 中明确区分各子 Agent 的使用场景          |
+
+
+
+# 总结
+
+
+
+
+
+1. **核心动机**：Context Quarantine（上下文隔离）——子 Agent 在独立上下文中工作，只返回精炼结果给主 Agent
+2. **字典方式定义**：必填字段 `name` + `description` + `system_prompt`（3 个）；`tools` 默认继承主 Agent，显式指定后完全替换；另有 `model`/`middleware`/`interrupt_on`/`skills`/`response_format`/`permissions` 可选字段
+3. **General-purpose 子 Agent**：默认可用，继承主 Agent 的显式工具、模型与 skills；使用自己的默认系统提示词并应用 Harness Profile 配置，不继承主 Agent 的 `system_prompt`；Todo 等额外中间件需单独配置，可通过 `GeneralPurposeSubagentProfile(enabled=False)` 禁用
+4. **CompiledSubAgent**：用预构建的 LangGraph 图作为子 Agent，适合复杂多步骤工作流
+5. **结构化输出**：通过 `response_format` 让子 Agent 返回 JSON，方便主 Agent 程序化处理（需 deepagents>=0.5.3）
+6. **最佳实践**：描述要具体、提示词要详细、工具集要精简、模型按需选择、返回结果要精炼
